@@ -188,9 +188,13 @@ function el(tag, attrs, ...children) {
       else e.setAttribute(k, v);
     }
   }
-  for (const child of children.flat()) {
-    if (child == null || child === false) continue;
-    e.appendChild(typeof child === "string" ? document.createTextNode(child) : child);
+  for (const child of children.flat(Infinity)) {
+    if (child == null || child === false || child === true || child === undefined) continue;
+    if (typeof child === "string" || typeof child === "number") {
+      e.appendChild(document.createTextNode(String(child)));
+    } else if (child instanceof Node) {
+      e.appendChild(child);
+    }
   }
   return e;
 }
