@@ -26,6 +26,11 @@
 <div id="app"></div>
 
 <script>
+window.onerror = function(msg, src, line) {
+  document.getElementById("app").innerHTML =
+    '<div style="color:#fc8181;padding:20px;font-family:monospace;font-size:13px;">'+
+    '❌ Error JS: ' + msg + '<br>Línea: ' + line + '</div>';
+};
 // ─── CONFIG ────────────────────────────────────────────────────────────────
 const GAS_URL = "https://script.google.com/macros/s/AKfycbxsVX-xP5GbfVWk2l2Ju2w96BqvHL5kYAR07iJmKmpY9Jpn9Gr9zuxe1t0c2Hyn3xbP/exec";
 const ANTHROPIC_URL = "https://api.anthropic.com/v1/messages";
@@ -647,22 +652,27 @@ try {
   const local = localStorage.getItem(LOCAL_KEY);
   if (local) state.allData = JSON.parse(local);
 } catch {}
+
+// Render immediately with local data
+state.syncing = true;
 render();
 
-loadFromGAS()
-  .then(data => {
-    if (Object.keys(data).length > 0) state.allData = data;
+// Then try to sync with GAS in background
+(async () => {
+  try {
+    const data = await loadFromGAS();
+    if (data && Object.keys(data).length > 0) state.allData = data;
     state.syncing = false;
     state.syncStatus = "loaded";
     render();
     setTimeout(() => { state.syncStatus = "idle"; render(); }, 2000);
-  })
-  .catch(e => {
+  } catch(e) {
     state.syncing = false;
     state.syncStatus = "error";
-    state.syncError = e.message || "Error";
+    state.syncError = e.message || "Sin conexión";
     render();
-  });
+  }
+})();
 </script>
 </body>
 </html>
