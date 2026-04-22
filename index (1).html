@@ -1,0 +1,678 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Ricardo · Tracker</title>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: linear-gradient(135deg, #0a0f1e 0%, #0d1528 50%, #0a0f1e 100%);
+      min-height: 100vh; color: #e2e8f0;
+      font-family: 'DM Sans', sans-serif;
+      padding-bottom: 80px;
+    }
+    input, textarea, button { font-family: 'DM Sans', sans-serif; }
+    textarea { resize: none; }
+    ::-webkit-scrollbar { width: 4px; height: 4px; }
+    ::-webkit-scrollbar-track { background: #0a0f1e; }
+    ::-webkit-scrollbar-thumb { background: #2d3748; border-radius: 4px; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .spin { display: inline-block; animation: spin 1s linear infinite; }
+  </style>
+</head>
+<body>
+<div id="app"></div>
+
+<script>
+window.onerror = function(msg, src, line) {
+  document.getElementById("app").innerHTML =
+    '<div style="color:#fc8181;padding:20px;font-family:monospace;font-size:13px;">'+
+    '❌ Error JS: ' + msg + '<br>Línea: ' + line + '</div>';
+};
+// ─── CONFIG ────────────────────────────────────────────────────────────────
+const GAS_URL = "https://script.google.com/macros/s/AKfycbxsVX-xP5GbfVWk2l2Ju2w96BqvHL5kYAR07iJmKmpY9Jpn9Gr9zuxe1t0c2Hyn3xbP/exec";
+const ANTHROPIC_URL = "https://api.anthropic.com/v1/messages";
+const LOCAL_KEY = "ricardo_tracker_local";
+
+const DAY_PROFILES = {
+  0: { label: "Descanso",     type: "rest",   tdee: 2100, targets: { kcal: 1700, protein: 120, carbs: 170, fat: 55 } },
+  1: { label: "Gym",          type: "gym",    tdee: 2420, targets: { kcal: 1712, protein: 144, carbs: 164, fat: 55 } },
+  2: { label: "Pádel",        type: "padel",  tdee: 2700, targets: { kcal: 1669, protein: 94,  carbs: 235, fat: 41 } },
+  3: { label: "Gym + Fútbol", type: "double", tdee: 2875, targets: { kcal: 1920, protein: 148, carbs: 258, fat: 34 } },
+  4: { label: "Gym",          type: "gym",    tdee: 2420, targets: { kcal: 1712, protein: 144, carbs: 164, fat: 55 } },
+  5: { label: "Descanso",     type: "rest",   tdee: 2100, targets: { kcal: 1700, protein: 120, carbs: 170, fat: 55 } },
+  6: { label: "Partido Fútbol", type: "match", tdee: 2800, targets: { kcal: 1900, protein: 130, carbs: 250, fat: 45 } },
+};
+const DAY_COLORS = { gym: "#63b3ed", padel: "#9f7aea", double: "#f6ad55", match: "#68d391", rest: "#4a5568" };
+const TODAY = new Date().toISOString().split("T")[0];
+
+// ─── STATE ─────────────────────────────────────────────────────────────────
+let state = {
+  selectedDate: TODAY,
+  allData: {},
+  activeTab: "log",
+  syncing: true,
+  syncStatus: "idle", // idle | saving | saved | loaded | error
+  syncError: "",
+  input: "",
+  loading: false,
+  error: null,
+  exInput: { name: "", duration: "", intensity: "media" },
+  exLoading: false,
+};
+
+// ─── GAS ───────────────────────────────────────────────────────────────────
+async function loadFromGAS() {
+  const res = await fetch(GAS_URL);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return await res.json();
+}
+async function saveToGAS(date, dayData) {
+  const res = await fetch(GAS_URL, {
+    method: "POST",
+    body: JSON.stringify({ date, data: dayData }),
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+}
+
+// ─── HELPERS ───────────────────────────────────────────────────────────────
+function getDayProfile(dateStr) {
+  return DAY_PROFILES[new Date(dateStr + "T12:00:00").getDay()];
+}
+function getDayData() {
+  return state.allData[state.selectedDate] || { entries: [], exercises: [] };
+}
+function getTotals(dayData) {
+  return (dayData.entries || []).reduce((a, e) => ({
+    kcal: a.kcal + (e.kcal || 0), protein: a.protein + (e.protein || 0),
+    carbs: a.carbs + (e.carbs || 0), fat: a.fat + (e.fat || 0),
+  }), { kcal: 0, protein: 0, carbs: 0, fat: 0 });
+}
+function getKcalBurned(dayData) {
+  return (dayData.exercises || []).reduce((a, e) => a + (e.kcal_burned || 0), 0);
+}
+function now() {
+  return new Date().toLocaleTimeString("es", { hour: "2-digit", minute: "2-digit" });
+}
+async function save(newDayData) {
+  state.allData[state.selectedDate] = newDayData;
+  try { localStorage.setItem(LOCAL_KEY, JSON.stringify(state.allData)); } catch {}
+  state.syncStatus = "saving"; state.syncError = ""; render();
+  try {
+    await saveToGAS(state.selectedDate, newDayData);
+    state.syncStatus = "saved"; render();
+    setTimeout(() => { state.syncStatus = "idle"; render(); }, 2000);
+  } catch (e) {
+    state.syncStatus = "error"; state.syncError = e.message || "Error";
+    render();
+    setTimeout(() => { state.syncStatus = "idle"; render(); }, 5000);
+  }
+}
+
+// ─── ANTHROPIC ─────────────────────────────────────────────────────────────
+async function callClaude(system, userMsg) {
+  const res = await fetch(ANTHROPIC_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 1000,
+      system,
+      messages: [{ role: "user", content: userMsg }]
+    })
+  });
+  const data = await res.json();
+  const text = data.content.map(b => b.text || "").join("");
+  return JSON.parse(text.replace(/```json|```/g, "").trim());
+}
+
+async function handleLog() {
+  if (!state.input.trim() || state.loading) return;
+  state.loading = true; state.error = null; render();
+  try {
+    const parsed = await callClaude(
+      `Eres un dietista deportivo. El usuario registra comida o ejercicio en español.
+Si es COMIDA responde SOLO JSON: {"type":"food","name":"...","kcal":N,"protein":N,"carbs":N,"fat":N,"meal":"desayuno|almuerzo|merienda|cena|snack","note":"consejo 1 frase"}
+Si es EJERCICIO responde SOLO JSON: {"type":"exercise","name":"...","kcal_burned":N,"duration_min":N,"note":"consejo 1 frase"}
+N son enteros. Sin backticks ni texto adicional.`,
+      state.input
+    );
+    const dayData = getDayData();
+    if (parsed.type === "food") {
+      await save({ ...dayData, entries: [...(dayData.entries || []), { ...parsed, time: now() }] });
+    } else {
+      await save({ ...dayData, exercises: [...(dayData.exercises || []), { ...parsed, time: now() }] });
+    }
+    state.input = "";
+  } catch { state.error = "Error al procesar. Intenta de nuevo."; }
+  state.loading = false; render();
+}
+
+async function handleExercise() {
+  if (!state.exInput.name || !state.exInput.duration || state.exLoading) return;
+  state.exLoading = true; render();
+  try {
+    const parsed = await callClaude(
+      `Eres especialista en fisiología del ejercicio. Calcula calorías quemadas y da consejo de recuperación.
+Responde SOLO JSON sin backticks: {"name":"...","kcal_burned":N,"duration_min":N,"intensity":"baja|media|alta","note":"consejo 1 frase","emoji":"emoji"}`,
+      `Actividad: ${state.exInput.name}, duración: ${state.exInput.duration} minutos, intensidad: ${state.exInput.intensity}. Peso atleta ~80kg.`
+    );
+    const dayData = getDayData();
+    await save({ ...dayData, exercises: [...(dayData.exercises || []), { ...parsed, type: "exercise", time: now() }] });
+    state.exInput = { name: "", duration: "", intensity: "media" };
+  } catch {}
+  state.exLoading = false; render();
+}
+
+async function removeEntry(idx, type) {
+  const dayData = getDayData();
+  if (type === "food") await save({ ...dayData, entries: dayData.entries.filter((_, i) => i !== idx) });
+  else await save({ ...dayData, exercises: dayData.exercises.filter((_, i) => i !== idx) });
+}
+
+// ─── RENDER ────────────────────────────────────────────────────────────────
+function el(tag, attrs, ...children) {
+  const e = document.createElement(tag);
+  if (attrs) {
+    for (const [k, v] of Object.entries(attrs)) {
+      if (k === "style" && typeof v === "object") Object.assign(e.style, v);
+      else if (k.startsWith("on")) e[k.toLowerCase()] = v;
+      else if (k === "className") e.className = v;
+      else if (k === "type") e.type = v;
+      else if (k === "placeholder") e.placeholder = v;
+      else if (k === "value") e.value = v;
+      else if (k === "disabled") e.disabled = v;
+      else if (k === "rows") e.rows = v;
+      else e.setAttribute(k, v);
+    }
+  }
+  for (const child of children.flat()) {
+    if (child == null || child === false) continue;
+    e.appendChild(typeof child === "string" ? document.createTextNode(child) : child);
+  }
+  return e;
+}
+
+function macroBar(label, current, target, color) {
+  const pct = Math.min((current / target) * 100, 100);
+  const over = current > target;
+  return el("div", { style: { marginBottom: "12px" } },
+    el("div", { style: { display: "flex", justifyContent: "space-between", marginBottom: "4px", fontSize: "13px", fontFamily: "'DM Mono', monospace" } },
+      el("span", { style: { color: "#a0aec0", textTransform: "uppercase", letterSpacing: "1px" } }, label),
+      el("span", { style: { color: over ? "#fc8181" : "#e2e8f0" } },
+        el("strong", { style: { color: over ? "#fc8181" : color } }, current + "g"), " / " + target + "g"
+      )
+    ),
+    el("div", { style: { background: "#1a2035", borderRadius: "4px", height: "8px", overflow: "hidden" } },
+      el("div", { style: { width: pct + "%", height: "100%", borderRadius: "4px", background: over ? "#fc8181" : color, transition: "width 0.6s", boxShadow: `0 0 8px ${color}55` } })
+    )
+  );
+}
+
+function kcalRing(current, target) {
+  const pct = Math.min(current / target, 1);
+  const over = current > target;
+  const r = 52, cx = 60, cy = 60;
+  const circ = 2 * Math.PI * r;
+  const dash = pct * circ;
+  const color = over ? "#fc8181" : current / target > 0.85 ? "#68d391" : "#63b3ed";
+  const ns = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(ns, "svg");
+  svg.setAttribute("width", "120"); svg.setAttribute("height", "120");
+  svg.style.display = "block"; svg.style.margin = "0 auto";
+  const mkCirc = (stroke, dash1, dash2, offset) => {
+    const c = document.createElementNS(ns, "circle");
+    c.setAttribute("cx", cx); c.setAttribute("cy", cy); c.setAttribute("r", r);
+    c.setAttribute("fill", "none"); c.setAttribute("stroke", stroke);
+    c.setAttribute("stroke-width", "10");
+    if (dash1 != null) { c.setAttribute("stroke-dasharray", `${dash1} ${dash2}`); c.setAttribute("stroke-dashoffset", offset); c.setAttribute("stroke-linecap", "round"); c.style.filter = `drop-shadow(0 0 6px ${color})`; }
+    return c;
+  };
+  svg.appendChild(mkCirc("#1a2035"));
+  svg.appendChild(mkCirc(color, dash, circ - dash, circ / 4));
+  const mkText = (y, size, weight, fill, text) => {
+    const t = document.createElementNS(ns, "text");
+    t.setAttribute("x", cx); t.setAttribute("y", y); t.setAttribute("text-anchor", "middle");
+    t.setAttribute("fill", fill); t.setAttribute("font-size", size); t.setAttribute("font-weight", weight);
+    t.setAttribute("font-family", "'DM Mono', monospace"); t.textContent = text;
+    return t;
+  };
+  svg.appendChild(mkText(cy - 6, "20", "700", color, current));
+  svg.appendChild(mkText(cy + 14, "11", "400", "#4a5568", `/ ${target} kcal`));
+  return svg;
+}
+
+function renderApp() {
+  const profile = getDayProfile(state.selectedDate);
+  const dayColor = DAY_COLORS[profile.type];
+  const dayData = getDayData();
+  const totals = getTotals(dayData);
+  const kcalBurned = getKcalBurned(dayData);
+  const remaining = {
+    kcal: profile.targets.kcal - totals.kcal,
+    protein: profile.targets.protein - totals.protein,
+    carbs: profile.targets.carbs - totals.carbs,
+    fat: profile.targets.fat - totals.fat,
+  };
+
+  // Week strip
+  const weekStart = new Date(state.selectedDate + "T12:00:00");
+  weekStart.setDate(weekStart.getDate() - ((weekStart.getDay() + 6) % 7));
+  const week = Array.from({ length: 7 }, (_, i) => {
+    const d = new Date(weekStart); d.setDate(d.getDate() + i);
+    return d.toISOString().split("T")[0];
+  });
+
+  // Sync badge
+  let syncBadge;
+  if (state.syncing) syncBadge = el("span", { style: { fontSize: "10px", color: "#9f7aea", fontFamily: "'DM Mono', monospace" } }, "⟳ Cargando...");
+  else if (state.syncStatus === "saving") syncBadge = el("span", { style: { fontSize: "10px", color: "#f6ad55", fontFamily: "'DM Mono', monospace" } }, "⟳ Guardando...");
+  else if (state.syncStatus === "saved") syncBadge = el("span", { style: { fontSize: "10px", color: "#68d391", fontFamily: "'DM Mono', monospace" } }, "✓ Google Sheets");
+  else if (state.syncStatus === "loaded") syncBadge = el("span", { style: { fontSize: "10px", color: "#68d391", fontFamily: "'DM Mono', monospace" } }, "✓ Conectado");
+  else if (state.syncStatus === "error") syncBadge = el("span", { style: { fontSize: "9px", color: "#fc8181", fontFamily: "'DM Mono', monospace" } }, "✗ " + (state.syncError || "Sin sync"));
+  else syncBadge = el("span", {});
+
+  // Header
+  const header = el("div", { style: { background: "linear-gradient(180deg,#0d1528 0%,transparent 100%)", padding: "24px 20px 0" } },
+    el("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "flex-start" } },
+      el("div", {},
+        el("div", { style: { display: "flex", alignItems: "center", gap: "8px" } },
+          el("span", { style: { fontSize: "11px", color: "#4a5568", textTransform: "uppercase", letterSpacing: "2px", fontFamily: "'DM Mono', monospace" } }, "Ricardo · Tracker"),
+          syncBadge
+        ),
+        el("h1", { style: { fontSize: "22px", fontWeight: "700", marginTop: "4px", letterSpacing: "-0.5px" } }, "Nutrición & Entreno")
+      ),
+      el("div", { style: { background: `${dayColor}22`, border: `1px solid ${dayColor}44`, borderRadius: "8px", padding: "6px 12px", textAlign: "center" } },
+        el("div", { style: { fontSize: "10px", color: dayColor, textTransform: "uppercase", letterSpacing: "1px", fontFamily: "'DM Mono', monospace" } }, "Hoy"),
+        el("div", { style: { fontSize: "13px", fontWeight: "700", color: dayColor } }, profile.label)
+      )
+    ),
+    // Week strip
+    el("div", { style: { display: "flex", gap: "6px", marginTop: "20px", overflowX: "auto", paddingBottom: "4px" } },
+      ...week.map(d => {
+        const p = getDayProfile(d);
+        const c = DAY_COLORS[p.type];
+        const isSel = d === state.selectedDate;
+        const isToday = d === TODAY;
+        const dayName = new Date(d + "T12:00:00").toLocaleDateString("es", { weekday: "short" });
+        const dayNum = new Date(d + "T12:00:00").getDate();
+        const hasData = state.allData[d]?.entries?.length > 0;
+        const btn = el("button", {
+          style: { flex: "0 0 auto", minWidth: "44px", padding: "8px 6px", borderRadius: "10px",
+            border: isSel ? `2px solid ${c}` : "2px solid transparent",
+            background: isSel ? `${c}18` : "transparent", cursor: "pointer" }
+        },
+          el("div", { style: { fontSize: "9px", color: isSel ? c : "#4a5568", textTransform: "uppercase", fontFamily: "'DM Mono', monospace" } }, dayName),
+          el("div", { style: { fontSize: "16px", fontWeight: "700", color: isSel ? c : isToday ? "#a0aec0" : "#4a5568", marginTop: "2px" } }, dayNum),
+          hasData ? el("div", { style: { width: "4px", height: "4px", borderRadius: "50%", background: c, margin: "3px auto 0" } }) : el("span", {})
+        );
+        btn.onclick = () => { state.selectedDate = d; render(); };
+        return btn;
+      })
+    )
+  );
+
+  // Tabs
+  const tabs = el("div", { style: { display: "flex", borderBottom: "1px solid #1a2035", margin: "16px 20px 0" } },
+    ...[ ["log","🍽️ Comida"], ["exercise","💪 Ejercicio"], ["stats","📊 Macros"], ["plan","🗓 Plan"] ].map(([key, label]) => {
+      const btn = el("button", {
+        style: { flex: "1", padding: "10px 0", border: "none", background: "transparent",
+          color: state.activeTab === key ? dayColor : "#4a5568",
+          borderBottom: state.activeTab === key ? `2px solid ${dayColor}` : "2px solid transparent",
+          fontSize: "12px", fontWeight: "600", cursor: "pointer" }
+      }, label);
+      btn.onclick = () => { state.activeTab = key; render(); };
+      return btn;
+    })
+  );
+
+  // Tab content
+  let content;
+  if (state.activeTab === "log") content = renderLogTab(dayData, dayColor);
+  else if (state.activeTab === "exercise") content = renderExerciseTab(dayData, dayColor, kcalBurned);
+  else if (state.activeTab === "stats") content = renderStatsTab(totals, remaining, profile, dayColor, kcalBurned);
+  else content = renderPlanTab(dayColor);
+
+  return el("div", { style: { minHeight: "100vh" } }, header, tabs, el("div", { style: { padding: "16px 20px" } }, content));
+}
+
+function renderLogTab(dayData, dayColor) {
+  const textarea = el("textarea", {
+    placeholder: "Escribe lo que comiste o el ejercicio... ej: 'avena con leche' o '30 min bicicleta'",
+    rows: "2",
+    style: { width: "100%", background: "transparent", border: "none", outline: "none", color: "#e2e8f0", fontSize: "14px", lineHeight: "1.6", fontFamily: "'DM Sans', sans-serif", minHeight: "60px", boxSizing: "border-box" }
+  });
+  textarea.value = state.input;
+  textarea.oninput = e => { state.input = e.target.value; };
+  textarea.onkeydown = e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handleLog(); } };
+
+  const regBtn = el("button", {
+    disabled: state.loading || !state.input.trim(),
+    style: { background: state.loading ? "#1a2035" : `linear-gradient(135deg,${dayColor},${dayColor}99)`, border: "none", borderRadius: "8px", padding: "8px 18px", color: state.loading ? "#4a5568" : "#0a0f1e", fontWeight: "700", fontSize: "13px", cursor: state.loading ? "not-allowed" : "pointer" }
+  }, state.loading ? "⏳ Analizando..." : "Registrar →");
+  regBtn.onclick = handleLog;
+
+  const inputBox = el("div", { style: { background: "#0d1528", borderRadius: "14px", padding: "16px", marginBottom: "20px", border: "1px solid #1a2035" } },
+    textarea,
+    el("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: "8px" } },
+      state.error ? el("span", { style: { fontSize: "11px", color: "#fc8181" } }, state.error) : el("span", { style: { fontSize: "11px", color: "#4a5568" } }, "Enter para registrar"),
+      regBtn
+    )
+  );
+
+  const foodItems = (dayData.entries || []).map((e, i) => {
+    const rm = el("button", { style: { background: "none", border: "none", color: "#4a5568", cursor: "pointer", fontSize: "16px", padding: "0", marginLeft: "8px" } }, "×");
+    rm.onclick = () => removeEntry(i, "food");
+    return el("div", { style: { background: "#0d1528", borderRadius: "12px", padding: "12px 14px", marginBottom: "8px", border: "1px solid #1a2035", display: "flex", justifyContent: "space-between", alignItems: "flex-start" } },
+      el("div", { style: { flex: "1" } },
+        el("div", { style: { display: "flex", gap: "8px", alignItems: "center", marginBottom: "4px" } },
+          el("span", { style: { fontSize: "13px", fontWeight: "600" } }, e.name),
+          el("span", { style: { fontSize: "10px", color: "#4a5568", fontFamily: "'DM Mono', monospace" } }, e.time),
+          e.meal ? el("span", { style: { fontSize: "10px", background: "#1a2035", borderRadius: "4px", padding: "1px 6px", color: "#718096" } }, e.meal) : el("span", {})
+        ),
+        el("div", { style: { display: "flex", gap: "12px", fontSize: "12px", fontFamily: "'DM Mono', monospace" } },
+          el("span", { style: { color: "#f6ad55" } }, e.kcal + " kcal"),
+          el("span", { style: { color: "#63b3ed" } }, "P:" + e.protein + "g"),
+          el("span", { style: { color: "#68d391" } }, "C:" + e.carbs + "g"),
+          el("span", { style: { color: "#f6ad55" } }, "G:" + e.fat + "g")
+        ),
+        e.note ? el("div", { style: { fontSize: "11px", color: "#4a5568", marginTop: "4px", fontStyle: "italic" } }, "💡 " + e.note) : el("span", {})
+      ),
+      rm
+    );
+  });
+
+  const exItems = (dayData.exercises || []).map((e, i) => {
+    const rm = el("button", { style: { background: "none", border: "none", color: "#4a5568", cursor: "pointer", fontSize: "16px", padding: "0", marginLeft: "8px" } }, "×");
+    rm.onclick = () => removeEntry(i, "exercise");
+    return el("div", { style: { background: "#0d1528", borderRadius: "12px", padding: "12px 14px", marginBottom: "8px", border: `1px solid ${dayColor}33`, display: "flex", justifyContent: "space-between", alignItems: "flex-start" } },
+      el("div", { style: { flex: "1" } },
+        el("div", { style: { display: "flex", gap: "8px", alignItems: "center", marginBottom: "4px" } },
+          el("span", { style: { fontSize: "13px", fontWeight: "600" } }, "🏃 " + e.name),
+          el("span", { style: { fontSize: "10px", color: "#4a5568", fontFamily: "'DM Mono', monospace" } }, e.time)
+        ),
+        el("div", { style: { display: "flex", gap: "12px", fontSize: "12px", fontFamily: "'DM Mono', monospace" } },
+          el("span", { style: { color: "#fc8181" } }, "-" + e.kcal_burned + " kcal"),
+          e.duration_min ? el("span", { style: { color: "#a0aec0" } }, e.duration_min + " min") : el("span", {})
+        ),
+        e.note ? el("div", { style: { fontSize: "11px", color: "#4a5568", marginTop: "4px", fontStyle: "italic" } }, "💡 " + e.note) : el("span", {})
+      ),
+      rm
+    );
+  });
+
+  const empty = !dayData.entries?.length && !dayData.exercises?.length
+    ? el("div", { style: { textAlign: "center", padding: "40px 20px", color: "#4a5568" } },
+        el("div", { style: { fontSize: "32px", marginBottom: "12px" } }, "🍽️"),
+        el("div", { style: { fontSize: "14px" } }, "Sin registros por ahora"),
+        el("div", { style: { fontSize: "12px", marginTop: "4px" } }, "Escribe arriba lo que comiste o el ejercicio realizado")
+      ) : el("span", {});
+
+  return el("div", {},
+    inputBox,
+    foodItems.length ? el("div", { style: { marginBottom: "20px" } },
+      el("div", { style: { fontSize: "11px", color: "#4a5568", textTransform: "uppercase", letterSpacing: "2px", fontFamily: "'DM Mono', monospace", marginBottom: "10px" } }, "Alimentos"),
+      ...foodItems
+    ) : el("span", {}),
+    exItems.length ? el("div", {},
+      el("div", { style: { fontSize: "11px", color: "#4a5568", textTransform: "uppercase", letterSpacing: "2px", fontFamily: "'DM Mono', monospace", marginBottom: "10px" } }, "Ejercicio"),
+      ...exItems
+    ) : el("span", {}),
+    empty
+  );
+}
+
+function renderExerciseTab(dayData, dayColor, kcalBurned) {
+  const nameInput = el("input", {
+    placeholder: "Actividad (ej: fútbol, gym, pádel, correr...)",
+    style: { width: "100%", background: "#1a2035", border: "1px solid #2d3748", borderRadius: "10px", padding: "10px 14px", color: "#e2e8f0", fontSize: "14px", outline: "none", boxSizing: "border-box", marginBottom: "10px" }
+  });
+  nameInput.value = state.exInput.name;
+  nameInput.oninput = e => { state.exInput.name = e.target.value; };
+
+  const durInput = el("input", { type: "number", placeholder: "60",
+    style: { width: "100%", background: "#1a2035", border: "1px solid #2d3748", borderRadius: "10px", padding: "10px 14px", color: "#e2e8f0", fontSize: "14px", outline: "none", boxSizing: "border-box", fontFamily: "'DM Mono', monospace" }
+  });
+  durInput.value = state.exInput.duration;
+  durInput.oninput = e => { state.exInput.duration = e.target.value; };
+
+  const intBtns = ["baja", "media", "alta"].map(lvl => {
+    const c = lvl === "alta" ? "#fc8181" : lvl === "media" ? "#f6ad55" : "#68d391";
+    const active = state.exInput.intensity === lvl;
+    const btn = el("button", {
+      style: { flex: "1", padding: "9px 4px", borderRadius: "8px", border: "none",
+        background: active ? c : "#1a2035", color: active ? "#0a0f1e" : "#4a5568",
+        fontSize: "11px", fontWeight: "700", cursor: "pointer", textTransform: "capitalize" }
+    }, lvl);
+    btn.onclick = () => { state.exInput.intensity = lvl; render(); };
+    return btn;
+  });
+
+  const quickBtns = [
+    { name: "Fútbol entrenamiento", dur: "60", int: "alta", emoji: "⚽" },
+    { name: "Partido de fútbol",    dur: "90", int: "alta", emoji: "🏆" },
+    { name: "Gym — Fuerza",         dur: "55", int: "media", emoji: "🏋️" },
+    { name: "Pádel",                dur: "90", int: "media", emoji: "🎾" },
+    { name: "Movilidad / Stretching", dur: "20", int: "baja", emoji: "🧘" },
+    { name: "HIIT intervalos",      dur: "25", int: "alta", emoji: "⚡" },
+  ].map(({ name, dur, int: intensity, emoji }) => {
+    const active = state.exInput.name === name;
+    const btn = el("button", {
+      style: { background: active ? `${dayColor}22` : "#1a2035", border: active ? `1px solid ${dayColor}` : "1px solid #2d3748",
+        borderRadius: "8px", padding: "6px 10px", color: active ? dayColor : "#718096",
+        fontSize: "11px", cursor: "pointer" }
+    }, emoji + " " + name);
+    btn.onclick = () => { state.exInput = { name, duration: dur, intensity }; render(); };
+    return btn;
+  });
+
+  const regBtn = el("button", {
+    disabled: state.exLoading || !state.exInput.name || !state.exInput.duration,
+    style: { width: "100%", background: state.exLoading ? "#1a2035" : `linear-gradient(135deg,${dayColor},${dayColor}99)`,
+      border: "none", borderRadius: "10px", padding: "12px",
+      color: state.exLoading ? "#4a5568" : "#0a0f1e", fontWeight: "700", fontSize: "14px",
+      cursor: state.exLoading ? "not-allowed" : "pointer" }
+  }, state.exLoading ? "⏳ Calculando calorías..." : "Registrar ejercicio →");
+  regBtn.onclick = handleExercise;
+
+  const form = el("div", { style: { background: "#0d1528", borderRadius: "14px", padding: "16px", marginBottom: "20px", border: "1px solid #1a2035" } },
+    el("div", { style: { fontSize: "11px", color: "#4a5568", textTransform: "uppercase", letterSpacing: "2px", fontFamily: "'DM Mono', monospace", marginBottom: "14px" } }, "Registrar Actividad"),
+    nameInput,
+    el("div", { style: { display: "flex", gap: "10px", marginBottom: "10px" } },
+      el("div", { style: { flex: "1" } },
+        el("div", { style: { fontSize: "10px", color: "#4a5568", textTransform: "uppercase", letterSpacing: "1px", fontFamily: "'DM Mono', monospace", marginBottom: "6px" } }, "Duración (min)"),
+        durInput
+      ),
+      el("div", { style: { flex: "1" } },
+        el("div", { style: { fontSize: "10px", color: "#4a5568", textTransform: "uppercase", letterSpacing: "1px", fontFamily: "'DM Mono', monospace", marginBottom: "6px" } }, "Intensidad"),
+        el("div", { style: { display: "flex", gap: "4px" } }, ...intBtns)
+      )
+    ),
+    el("div", { style: { fontSize: "10px", color: "#4a5568", textTransform: "uppercase", letterSpacing: "1px", fontFamily: "'DM Mono', monospace", marginBottom: "8px" } }, "Accesos rápidos"),
+    el("div", { style: { display: "flex", flexWrap: "wrap", gap: "6px", marginBottom: "14px" } }, ...quickBtns),
+    regBtn
+  );
+
+  const exercises = dayData.exercises || [];
+  const history = exercises.length > 0
+    ? el("div", {},
+        el("div", { style: { fontSize: "11px", color: "#4a5568", textTransform: "uppercase", letterSpacing: "2px", fontFamily: "'DM Mono', monospace", marginBottom: "10px" } }, "Actividad de hoy"),
+        el("div", { style: { background: `${dayColor}18`, border: `1px solid ${dayColor}33`, borderRadius: "12px", padding: "12px 16px", marginBottom: "14px", display: "flex", justifyContent: "space-around" } },
+          el("div", { style: { textAlign: "center" } },
+            el("div", { style: { fontSize: "22px", fontWeight: "700", color: "#fc8181", fontFamily: "'DM Mono', monospace" } }, kcalBurned),
+            el("div", { style: { fontSize: "10px", color: "#4a5568", textTransform: "uppercase" } }, "kcal quemadas")
+          ),
+          el("div", { style: { textAlign: "center" } },
+            el("div", { style: { fontSize: "22px", fontWeight: "700", color: dayColor, fontFamily: "'DM Mono', monospace" } }, exercises.reduce((a, e) => a + (e.duration_min || 0), 0)),
+            el("div", { style: { fontSize: "10px", color: "#4a5568", textTransform: "uppercase" } }, "min totales")
+          ),
+          el("div", { style: { textAlign: "center" } },
+            el("div", { style: { fontSize: "22px", fontWeight: "700", color: "#9f7aea", fontFamily: "'DM Mono', monospace" } }, exercises.length),
+            el("div", { style: { fontSize: "10px", color: "#4a5568", textTransform: "uppercase" } }, "actividades")
+          )
+        ),
+        ...exercises.map((e, i) => {
+          const intColor = e.intensity === "alta" ? "#fc8181" : e.intensity === "media" ? "#f6ad55" : "#68d391";
+          const rm = el("button", { style: { background: "none", border: "none", color: "#4a5568", cursor: "pointer", fontSize: "18px", padding: "0", marginLeft: "8px" } }, "×");
+          rm.onclick = () => removeEntry(i, "exercise");
+          return el("div", { style: { background: "#0d1528", borderRadius: "12px", padding: "14px 16px", marginBottom: "8px", border: `1px solid ${dayColor}22`, display: "flex", justifyContent: "space-between", alignItems: "flex-start" } },
+            el("div", { style: { flex: "1" } },
+              el("div", { style: { display: "flex", gap: "8px", alignItems: "center", marginBottom: "6px" } },
+                el("span", { style: { fontSize: "18px" } }, e.emoji || "🏃"),
+                el("span", { style: { fontSize: "14px", fontWeight: "700" } }, e.name),
+                el("span", { style: { fontSize: "10px", color: "#4a5568", fontFamily: "'DM Mono', monospace" } }, e.time)
+              ),
+              el("div", { style: { display: "flex", gap: "10px", flexWrap: "wrap" } },
+                el("span", { style: { background: "#fc818122", color: "#fc8181", borderRadius: "6px", padding: "3px 8px", fontSize: "12px", fontFamily: "'DM Mono', monospace" } }, "🔥 -" + e.kcal_burned + " kcal"),
+                el("span", { style: { background: "#1a2035", color: "#a0aec0", borderRadius: "6px", padding: "3px 8px", fontSize: "12px", fontFamily: "'DM Mono', monospace" } }, "⏱ " + e.duration_min + " min"),
+                e.intensity ? el("span", { style: { background: intColor + "22", color: intColor, borderRadius: "6px", padding: "3px 8px", fontSize: "12px" } }, e.intensity) : el("span", {})
+              ),
+              e.note ? el("div", { style: { fontSize: "11px", color: "#4a5568", marginTop: "6px", fontStyle: "italic" } }, "💡 " + e.note) : el("span", {})
+            ), rm
+          );
+        })
+      )
+    : el("div", { style: { textAlign: "center", padding: "40px 20px", color: "#4a5568" } },
+        el("div", { style: { fontSize: "32px", marginBottom: "12px" } }, "💪"),
+        el("div", { style: { fontSize: "14px" } }, "Sin ejercicio registrado hoy"),
+        el("div", { style: { fontSize: "12px", marginTop: "4px" } }, "Usa los accesos rápidos o escribe tu actividad")
+      );
+
+  return el("div", {}, form, history);
+}
+
+function renderStatsTab(totals, remaining, profile, dayColor, kcalBurned) {
+  const cards = [
+    { label: "Quemadas",    val: kcalBurned,                               color: "#fc8181", suffix: "kcal" },
+    { label: "Restantes",   val: Math.max(remaining.kcal, 0),              color: "#68d391", suffix: "kcal" },
+    { label: "TDEE",        val: profile.tdee,                             color: "#4a5568", suffix: "kcal" },
+    { label: "Déficit obj.", val: profile.tdee - profile.targets.kcal,     color: "#9f7aea", suffix: "kcal" },
+  ].map(({ label, val, color, suffix }) =>
+    el("div", { style: { background: "#0d1528", borderRadius: "10px", padding: "10px 12px", border: "1px solid #1a2035" } },
+      el("div", { style: { fontSize: "10px", color: "#4a5568", textTransform: "uppercase", letterSpacing: "1px", fontFamily: "'DM Mono', monospace" } }, label),
+      el("div", { style: { fontSize: "18px", fontWeight: "700", color, fontFamily: "'DM Mono', monospace" } }, val,
+        el("span", { style: { fontSize: "11px", fontWeight: "400", marginLeft: "2px", color: "#4a5568" } }, suffix)
+      )
+    )
+  );
+
+  const remItems = [
+    { label: "Proteína", val: remaining.protein, unit: "g", color: "#63b3ed" },
+    { label: "Carbs",    val: remaining.carbs,   unit: "g", color: "#68d391" },
+    { label: "Grasas",   val: remaining.fat,     unit: "g", color: "#f6ad55" },
+  ].map(({ label, val, unit, color }) =>
+    el("div", { style: { textAlign: "center", background: "#1a2035", borderRadius: "10px", padding: "10px 6px" } },
+      el("div", { style: { fontSize: "18px", fontWeight: "700", color: val < 0 ? "#fc8181" : color, fontFamily: "'DM Mono', monospace" } },
+        (val < 0 ? "+" + Math.abs(val) : val) + unit
+      ),
+      el("div", { style: { fontSize: "10px", color: "#4a5568", textTransform: "uppercase", marginTop: "2px" } }, label),
+      el("div", { style: { fontSize: "9px", color: val < 0 ? "#fc8181" : "#4a5568", marginTop: "2px" } }, val < 0 ? "exceso" : "restante")
+    )
+  );
+
+  const ring = el("div", { style: { flex: "1", background: "#0d1528", borderRadius: "14px", padding: "16px", border: "1px solid #1a2035" } });
+  ring.appendChild(kcalRing(totals.kcal, profile.targets.kcal));
+  ring.appendChild(el("div", { style: { textAlign: "center", marginTop: "8px", fontSize: "11px", color: "#4a5568", fontFamily: "'DM Mono', monospace", textTransform: "uppercase", letterSpacing: "1px" } }, "Consumidas"));
+
+  return el("div", {},
+    el("div", { style: { display: "flex", gap: "16px", marginBottom: "20px" } },
+      ring,
+      el("div", { style: { flex: "1", display: "flex", flexDirection: "column", gap: "8px" } }, ...cards)
+    ),
+    el("div", { style: { background: "#0d1528", borderRadius: "14px", padding: "16px", border: "1px solid #1a2035", marginBottom: "16px" } },
+      el("div", { style: { fontSize: "11px", color: "#4a5568", textTransform: "uppercase", letterSpacing: "2px", fontFamily: "'DM Mono', monospace", marginBottom: "14px" } }, "Macronutrientes"),
+      macroBar("Proteína", totals.protein, profile.targets.protein, "#63b3ed"),
+      macroBar("Carbohidratos", totals.carbs, profile.targets.carbs, "#68d391"),
+      macroBar("Grasas", totals.fat, profile.targets.fat, "#f6ad55")
+    ),
+    el("div", { style: { background: "#0d1528", borderRadius: "14px", padding: "16px", border: "1px solid #1a2035" } },
+      el("div", { style: { fontSize: "11px", color: "#4a5568", textTransform: "uppercase", letterSpacing: "2px", fontFamily: "'DM Mono', monospace", marginBottom: "12px" } }, "Pendiente por consumir"),
+      el("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "10px" } }, ...remItems)
+    )
+  );
+}
+
+function renderPlanTab(dayColor) {
+  const planDays = [
+    { day: "Lunes",     label: "Gym — Fuerza tren inferior",  detail: "Sentadilla, hip thrust, prensa. Énfasis en explosividad.",          color: "#63b3ed" },
+    { day: "Martes",    label: "Pádel 90 min",                detail: "Cardio + agilidad. Hidratación: 1.5L durante sesión.",              color: "#9f7aea" },
+    { day: "Miércoles", label: "Gym + Fútbol (doble sesión)", detail: "Gym: tren superior mañana. Fútbol: tarde. Comida ligera entre.",    color: "#f6ad55" },
+    { day: "Jueves",    label: "Gym — Fuerza tren superior",  detail: "Press, dominadas, remo. Recuperación activa L5-S1 al final.",       color: "#63b3ed" },
+    { day: "Viernes",   label: "Descanso activo",             detail: "Movilidad, foam rolling, activación de core (sin carga).",          color: "#4a5568" },
+    { day: "Sábado",    label: "Partido de Fútbol 8:00 AM",   detail: "Desayuno 06:30 ligero. Carbos rápidos solo. Sin fibra.",            color: "#68d391" },
+    { day: "Domingo",   label: "Descanso total",              detail: "Recuperación. Proteína alta, carbos bajos.",                        color: "#4a5568" },
+  ];
+  const tips = [
+    { icon: "⚡", title: "Explosividad",          desc: "Añadir saltos pliométricos (box jumps) los jueves. 3×5 reps máxima intensidad antes del trabajo de fuerza." },
+    { icon: "🏃", title: "Resistencia",            desc: "Intervalos HIIT post-pádel: 6×30s sprint / 90s trote. Mejora umbral anaeróbico sin masa extra." },
+    { icon: "🦵", title: "Tren inferior L5-S1",    desc: "Evitar carga axial pesada. Prioriza: prensa, hip thrust, step-ups, split squat búlgaro." },
+    { icon: "🧠", title: "Agilidad + cambio ritmo", desc: "Viernes movilidad: incluir ladder drills 10 min. Coordinación neuromuscular sin carga espinal." },
+  ];
+
+  return el("div", {},
+    el("div", { style: { background: "#0d1528", borderRadius: "14px", padding: "16px", border: "1px solid #1a2035", marginBottom: "16px" } },
+      el("div", { style: { fontSize: "11px", color: "#4a5568", textTransform: "uppercase", letterSpacing: "2px", fontFamily: "'DM Mono', monospace", marginBottom: "14px" } }, "Plan Semanal"),
+      ...planDays.map(({ day, label, detail, color }) =>
+        el("div", { style: { display: "flex", gap: "12px", marginBottom: "12px", alignItems: "flex-start" } },
+          el("div", { style: { width: "60px", flexShrink: "0" } },
+            el("div", { style: { fontSize: "11px", color, fontWeight: "700", fontFamily: "'DM Mono', monospace" } }, day)
+          ),
+          el("div", { style: { borderLeft: `2px solid ${color}44`, paddingLeft: "12px", flex: "1" } },
+            el("div", { style: { fontSize: "13px", fontWeight: "600", color: "#e2e8f0" } }, label),
+            el("div", { style: { fontSize: "11px", color: "#718096", marginTop: "2px" } }, detail)
+          )
+        )
+      )
+    ),
+    el("div", { style: { background: "#0d1528", borderRadius: "14px", padding: "16px", border: "1px solid #1a2035" } },
+      el("div", { style: { fontSize: "11px", color: "#4a5568", textTransform: "uppercase", letterSpacing: "2px", fontFamily: "'DM Mono', monospace", marginBottom: "14px" } }, "Foco Rendimiento Fútbol"),
+      ...tips.map(({ icon, title, desc }) =>
+        el("div", { style: { marginBottom: "14px" } },
+          el("div", { style: { display: "flex", gap: "8px", alignItems: "center", marginBottom: "4px" } },
+            el("span", { style: { fontSize: "16px" } }, icon),
+            el("span", { style: { fontSize: "13px", fontWeight: "700", color: dayColor } }, title)
+          ),
+          el("div", { style: { fontSize: "12px", color: "#718096", lineHeight: "1.5", paddingLeft: "24px" } }, desc)
+        )
+      )
+    )
+  );
+}
+
+function render() {
+  const app = document.getElementById("app");
+  app.innerHTML = "";
+  app.appendChild(renderApp());
+}
+
+// ─── INIT ──────────────────────────────────────────────────────────────────
+try {
+  const local = localStorage.getItem(LOCAL_KEY);
+  if (local) state.allData = JSON.parse(local);
+} catch {}
+
+// Render immediately with local data
+state.syncing = true;
+render();
+
+// Then try to sync with GAS in background
+(async () => {
+  try {
+    const data = await loadFromGAS();
+    if (data && Object.keys(data).length > 0) state.allData = data;
+    state.syncing = false;
+    state.syncStatus = "loaded";
+    render();
+    setTimeout(() => { state.syncStatus = "idle"; render(); }, 2000);
+  } catch(e) {
+    state.syncing = false;
+    state.syncStatus = "error";
+    state.syncError = e.message || "Sin conexión";
+    render();
+  }
+})();
+</script>
+</body>
+</html>
